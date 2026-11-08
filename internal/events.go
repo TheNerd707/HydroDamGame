@@ -1,0 +1,15 @@
+package internal
+
+import (
+	"fmt"
+)
+
+func GridUpdateEvent(events chan string, newDemand float64) {
+	message := fmt.Sprintf("GRID UPDATE: New grid demand is %.1f MW", newDemand)
+	events <- message
+}
+
+func OffsidePowerEvent(events chan string) {
+	message := "ALERT: Offside power trip. Shutdown turbines to prevent damage."
+	events <- message
+}
