@@ -17,6 +17,13 @@ type tickMsg time.Time
 
 type stringMsg string
 
+type offsidePowerUpdate string
+
+const (
+	offsidePowerShutdown  offsidePowerUpdate = "shutdown"
+	offsidePowerRecovered offsidePowerUpdate = "recovered"
+)
+
 type Model struct {
 	input                 textarea.Model
 	lastCommand           string
@@ -29,10 +36,12 @@ type Model struct {
 	pastCommands          []string
 	eventLog              []string
 	events                chan string
+	offsidePowerUpdates   chan offsidePowerUpdate
 	asciiLoop             int
 	eventCount            int
 	pauseGrid             bool
 	lastOffsidePowerEvent time.Time
+	gridMatchTicks        int
 }
 
 type reservoir struct {
@@ -125,7 +134,8 @@ type Dam struct {
 }
 
 type GameState struct {
-	dam *Dam
+	dam    *Dam
+	points int
 }
 
 func newModel(gameState GameState) Model {
@@ -137,16 +147,17 @@ func newModel(gameState GameState) Model {
 	input.SetWidth(70)
 
 	return Model{
-		input:        input,
-		lastCommand:  "None yet",
-		now:          0,
-		nowCount:     0,
-		screen:       "main",
-		width:        200,
-		gameState:    gameState,
-		pastCommands: []string{},
-		eventLog:     []string{""},
-		events:       make(chan string, 16),
+		input:               input,
+		lastCommand:         "None yet",
+		now:                 0,
+		nowCount:            0,
+		screen:              "main",
+		width:               200,
+		gameState:           gameState,
+		pastCommands:        []string{},
+		eventLog:            []string{""},
+		events:              make(chan string, 16),
+		offsidePowerUpdates: make(chan offsidePowerUpdate, 2),
 	}
 }
 
@@ -184,7 +195,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if rand.Float64() < 0.01 {
 			m.eventCount++
 		}
-		if m.eventCount > 5 && (m.lastOffsidePowerEvent.IsZero() || time.Since(m.lastOffsidePowerEvent) >= 5*time.Minute) {
+		if m.eventCount > 25 && (m.lastOffsidePowerEvent.IsZero() || time.Since(m.lastOffsidePowerEvent) >= 5*time.Minute) {
 			internal.OffsidePowerEvent(m.events)
 			m.eventCount = -1
 			m.pauseGrid = true
@@ -192,15 +203,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			go func() {
 				time.Sleep(60 * time.Second)
-
-				m.gameState.dam.grid.online = false
-				m.gameState.dam.grid.demand = 0
+				m.offsidePowerUpdates <- offsidePowerShutdown
 
 				time.Sleep(30 * time.Second)
-
-				m.gameState.dam.grid.online = true
-				m.pauseGrid = false
-				m.events <- "INFO: Offside power trip resolved. Grid is back online."
+				m.offsidePowerUpdates <- offsidePowerRecovered
 			}()
 
 		}
@@ -213,13 +219,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.nowCount%(60*10) == 0 {
 			text := fmt.Sprintf("LOG: dam level at: %03.0fm", m.gameState.dam.reservoir.depth)
 			m.addEventLog(text)
-			if m.pauseGrid == false {
+			if !m.pauseGrid {
 				newDemand := 50 + rand.Float64()*150
 				m.gameState.dam.grid.demand = newDemand
 				internal.GridUpdateEvent(m.events, newDemand)
 			}
 		}
 		m.gameState.dam.reservoirUpdate(0.1)
+		select {
+		case update := <-m.offsidePowerUpdates:
+			switch update {
+			case offsidePowerShutdown:
+				m.gameState.dam.grid.online = false
+				m.gameState.dam.grid.demand = 0
+
+				successfulShutdown := true
+				for _, turbine := range m.gameState.dam.turbines {
+					if turbine.status != "Offline" {
+						successfulShutdown = false
+						m.events <- fmt.Sprintf("Turbine %d was not shutdown. 5 points lost", turbine.unitNumber)
+						m.gameState.points -= 5
+					}
+				}
+				if successfulShutdown {
+					m.gameState.points += 20
+					m.events <- "All turbines shutdown successfully. 20 points awarded."
+				}
+			case offsidePowerRecovered:
+				m.gameState.dam.grid.online = true
+				m.pauseGrid = false
+				m.events <- "INFO: Offside power trip resolved. Grid is back online."
+				m.lastOffsidePowerEvent = time.Now()
+				m.gameState.dam.grid.demand = 50 + rand.Float64()*150
+			}
+		default:
+		}
+		totalPower := m.gameState.dam.totalPower()
+		demand := m.gameState.dam.grid.demand
+		if m.gameState.dam.grid.online && demand > 0 && math.Abs(totalPower-demand) <= demand*0.05 {
+			m.gridMatchTicks++
+			if m.gridMatchTicks >= 100 {
+				m.gameState.points++
+				m.gridMatchTicks = 0
+			}
+		} else {
+			m.gridMatchTicks = 0
+		}
 		for {
 			select {
 			case event := <-m.events:
@@ -240,6 +285,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (d Dam) totalPower() float64 {
+	totalPower := 0.0
+	for _, generator := range d.generators {
+		power := 1000 * 9.81 * generator.turbine.flowRate * generator.efficiency * generator.turbine.turbineEfficency * (d.reservoir.depth - d.reservoir.tailwater.height - d.turbines[generator.turbine.unitNumber-1].netHeadLoss) / 1e6
+		if !generator.turbine.synced {
+			power = 0
+		}
+		totalPower += power
+	}
+	return totalPower
+}
+
 func formatFlow(flow float64) string {
 	if flow >= 100 || flow <= -100 {
 		return fmt.Sprintf("%4.0f", flow)
@@ -249,7 +306,7 @@ func formatFlow(flow float64) string {
 
 func (m Model) View() string {
 	asciiArtArray := ascii(m.asciiLoop%3+1, m.width, m.gameState.dam.reservoir.depth)
-	headerStatus := fmt.Sprintf("SHIFT %02d  %02d:%02d", m.now/60/24+1, m.now/60%24, m.now%60)
+	headerStatus := fmt.Sprintf("Day %02d  %02d:%02d  POINTS:%2d", m.now/60/24+1, m.now/60%24, m.now%60, m.gameState.points)
 
 	turbineStatus := ""
 	for i, turbine := range m.gameState.dam.turbines {
@@ -263,7 +320,6 @@ func (m Model) View() string {
 	}
 
 	generatorStatus := ""
-	totalPower := 0.0
 	for i, generator := range m.gameState.dam.generators {
 		turbineUnitNumber := "N/A"
 		if generator.turbine != nil {
@@ -273,8 +329,6 @@ func (m Model) View() string {
 		if !generator.turbine.synced {
 			power = 0
 		}
-		totalPower += power
-
 		generatorStatus += fmt.Sprintf(
 			"║   %-19s%s%24s%16.1fMW  ║"+asciiArtArray[14+i],
 			fmt.Sprintf("%02d", generator.turbine.unitNumber),
@@ -297,7 +351,7 @@ func (m Model) View() string {
 
 	main := fmt.Sprintf(
 		"╔════════════════════════════════════════════════════════════════════╗"+asciiArtArray[0]+
-			"║%-43s%23s  ║"+asciiArtArray[1]+
+			"║%-42s%23s  ║"+asciiArtArray[1]+
 			"╠════════════════════════════════════════════════════════════════════╣"+asciiArtArray[2]+
 			"║  RESERVOIR                                                         ║"+asciiArtArray[3]+
 			"║  Depth: %03.0fm          Inflow: %sm³/s          Outflow: %sm³/s  ║"+asciiArtArray[4]+
@@ -311,7 +365,7 @@ func (m Model) View() string {
 			"%s"+
 			"║                                                                    ║"+asciiArtArray[17]+
 			"║  TOTAL GENERATION: %6.1fMW                                        ║"+asciiArtArray[18]+
-			"║  GRID DEMAND: %03.1fMW                                              ║"+asciiArtArray[19]+
+			"║  GRID DEMAND: %6.1fMW                                             ║"+asciiArtArray[19]+
 			"╠════════════════════════════════════════════════════════════════════╣"+asciiArtArray[20]+
 			"║   ACTIVE ALARMS: %01d                                                 ║"+asciiArtArray[21]+
 			"╚════════════════════════════════════════════════════════════════════╝"+asciiArtArray[22]+
@@ -323,7 +377,7 @@ func (m Model) View() string {
 		formatFlow(math.Abs(m.gameState.dam.calcTotalFLow()-m.gameState.dam.reservoir.inflow)),
 		turbineStatus,
 		generatorStatus,
-		totalPower,
+		m.gameState.dam.totalPower(),
 		m.gameState.dam.grid.demand,
 		0,
 		past,
@@ -387,12 +441,12 @@ func (m *Model) addEventLog(event string) {
 		m.eventLog[i] = m.eventLog[i+1]
 	}
 	event = fmt.Sprintf("[%02d:%02d] %s", m.now/60%24, m.now%60, event)
-	if len(event) < 70 {
-		text := fmt.Sprintf("%-70s", event)
+	if len(event) < 90 {
+		text := fmt.Sprintf("%-90s", event)
 		m.eventLog[len(m.eventLog)-1] = text
 	} else {
-		lines := wrapText(event, 70)
-		text := fmt.Sprintf("%-70s", lines[0])
+		lines := wrapText(event, 90)
+		text := fmt.Sprintf("%-90s", lines[0])
 		m.eventLog[len(m.eventLog)-1] = text
 		lines = lines[1:]
 		rest := strings.Join(lines, "")
@@ -691,7 +745,7 @@ func CommandHandler(m *Model, command string) {
 			m.commandOutput("ERR: Stop currently can only be used for turbines, contact ${SYSTEMADMIN} for more information")
 		}
 	case "help":
-		m.commandOutput("Available commands: start, wicket, help. Start takes arguments: start turbine unitId. Wicket takes arguments: wicket unitId angle.")
+		m.commandOutput("Available commands: start, stop, wicket, help. Start takes arguments: start turbine unitId. Wicket takes arguments: wicket unitId angle.")
 	default:
 		text := fmt.Sprintf("Command %s is unreconized. Type 'help' for help", command)
 		m.commandOutput(text)
