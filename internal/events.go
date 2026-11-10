@@ -10,6 +10,6 @@ func GridUpdateEvent(events chan string, newDemand float64) {
 }
 
 func OffsidePowerEvent(events chan string) {
-	message := "ALERT: Offside power trip. Shutdown turbines to prevent damage."
+	message := "\033[41mALERT: Offside power trip. Shutdown turbines to prevent damage.\033[0m"
 	events <- message
 }
